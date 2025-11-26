@@ -381,8 +381,8 @@ jobs:
       
       - name: Commit and Push Changes
         run: |
-          # Add all modified files in .tekton directory
-          git add .tekton/
+          # Add all modified files in .tekton directory (force add in case of .gitignore)
+          git add -f .tekton/
           
           # Check for changes before committing
           if [[ -n "$(git status --porcelain)" ]]; then
