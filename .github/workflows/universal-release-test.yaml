@@ -1,4 +1,7 @@
-name: Unified ODH Release Workflow
+name: Universal ODH Release Workflow (Test)
+
+# This is a test version for personal repositories
+# Use this to test the workflow before deploying to production
 
 on:
   workflow_dispatch:
@@ -12,18 +15,23 @@ on:
           - kserve
           - llm-d-inference-scheduler
       tag_name:
-        description: 'New release tag (e.g., odh-v2.35)'
+        description: 'New release tag (e.g., odh-v2.35 or test-v0.1)'
         required: true
         type: string
       next_odh_tag:
-        description: 'Next development tag (e.g., odh-v2.36)'
+        description: 'Next development tag (e.g., odh-v2.36 or test-v0.2)'
         required: true
         type: string
       target_branch:
-        description: 'Target branch in the repository (e.g., main, incubating)'
+        description: 'Target branch in the repository (e.g., main, master, incubating)'
         required: false
         type: string
         default: 'main'
+      github_owner:
+        description: 'GitHub username/org (defaults to your username)'
+        required: false
+        type: string
+        default: ''
 
 permissions:
   contents: write
@@ -31,8 +39,9 @@ permissions:
   pull-requests: write
   
 env:
-  # Repository owner - adjust if needed
-  REPO_OWNER: opendatahub-io
+  # For testing with personal repos, this will use the workflow runner's username
+  # or the value provided in github_owner input
+  REPO_OWNER: ${{ github.event.inputs.github_owner != '' && github.event.inputs.github_owner || github.repository_owner }}
   
 jobs:
   setup:
@@ -40,18 +49,30 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       repo_name: ${{ steps.set_vars.outputs.repo_name }}
+      repo_owner: ${{ steps.set_vars.outputs.repo_owner }}
     steps:
-      - name: Set repository name
+      - name: Set repository variables
         id: set_vars
         run: |
-          echo "repo_name=${{ github.event.inputs.repository }}" >> $GITHUB_OUTPUT
+          OWNER="${{ env.REPO_OWNER }}"
+          REPO="${{ github.event.inputs.repository }}"
+          
+          echo "repo_name=${REPO}" >> $GITHUB_OUTPUT
+          echo "repo_owner=${OWNER}" >> $GITHUB_OUTPUT
+          
+          echo "📦 Testing with:"
+          echo "  Owner: ${OWNER}"
+          echo "  Repository: ${REPO}"
+          echo "  Full path: ${OWNER}/${REPO}"
       
       - name: Display configuration
         run: |
-          echo "Repository: ${{ steps.set_vars.outputs.repo_name }}"
-          echo "Target Branch: ${{ github.event.inputs.target_branch }}"
-          echo "Release Tag: ${{ github.event.inputs.tag_name }}"
-          echo "Next Tag: ${{ github.event.inputs.next_odh_tag }}"
+          echo "🎯 Test Configuration:"
+          echo "  Repository Owner: ${{ steps.set_vars.outputs.repo_owner }}"
+          echo "  Repository: ${{ steps.set_vars.outputs.repo_name }}"
+          echo "  Target Branch: ${{ github.event.inputs.target_branch }}"
+          echo "  Release Tag: ${{ github.event.inputs.tag_name }}"
+          echo "  Next Tag: ${{ github.event.inputs.next_odh_tag }}"
 
   validate-and-check:
     name: Validate and Check Tag
@@ -61,8 +82,8 @@ jobs:
       - name: Checkout target repository
         uses: actions/checkout@v4
         with:
-          repository: ${{ env.REPO_OWNER }}/${{ needs.setup.outputs.repo_name }}
-          token: ${{ secrets.ROBOT_ACCOUNT_PAT }}
+          repository: ${{ needs.setup.outputs.repo_owner }}/${{ needs.setup.outputs.repo_name }}
+          token: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
           ref: ${{ github.event.inputs.target_branch }}
           fetch-depth: 0
       
@@ -74,44 +95,51 @@ jobs:
           tag_name = "${{ github.event.inputs.tag_name }}"
           next_tag = "${{ github.event.inputs.next_odh_tag }}"
           
-          # Expected format: odh-vX.Y or odh-vX.Y.Z
-          tag_pattern = r'^odh-v\d+\.\d+(\.\d+)?$'
+          # Expected format: odh-vX.Y or odh-vX.Y.Z (relaxed for testing)
+          # Also accept test-vX.Y for testing purposes
+          tag_pattern = r'^(odh|test)-v\d+\.\d+(\.\d+)?$'
           
           if not re.match(tag_pattern, tag_name):
-            print(f"Error: Tag '{tag_name}' does not match expected format 'odh-vX.Y' or 'odh-vX.Y.Z'", file=sys.stderr)
-            print(f"Examples: odh-v2.35, odh-v2.35.1", file=sys.stderr)
-            sys.exit(1)
+            print(f"⚠️  Warning: Tag '{tag_name}' does not match expected format", file=sys.stderr)
+            print(f"   Expected: 'odh-vX.Y', 'odh-vX.Y.Z', 'test-vX.Y', or 'test-vX.Y.Z'", file=sys.stderr)
+            print(f"   Examples: odh-v2.35, test-v0.1", file=sys.stderr)
+            # For testing, we'll allow it to continue with a warning
+            print(f"   Continuing anyway for test purposes...")
+          else:
+            print(f"✓ Tag format validation passed")
           
           if not re.match(tag_pattern, next_tag):
-            print(f"Error: Next tag '{next_tag}' does not match expected format 'odh-vX.Y' or 'odh-vX.Y.Z'", file=sys.stderr)
-            print(f"Examples: odh-v2.36, odh-v2.36.0", file=sys.stderr)
-            sys.exit(1)
+            print(f"⚠️  Warning: Next tag '{next_tag}' does not match expected format", file=sys.stderr)
+            print(f"   Continuing anyway for test purposes...")
+          else:
+            print(f"✓ Next tag format validation passed")
           
-          print(f"  Tag format validation passed")
           print(f"  Release tag: {tag_name}")
           print(f"  Next tag: {next_tag}")
         shell: python
       
-      - name: Validate Tekton directory exists
+      - name: Validate Tekton directory exists (Optional for testing)
         run: |
           if [ ! -d ".tekton" ]; then
-            echo "Error: .tekton directory not found" >&2
-            echo "This workflow should be run on the correct release branch." >&2
-            exit 1
+            echo "⚠️  Warning: .tekton directory not found"
+            echo "   This is OK for testing. The workflow will skip Tekton updates."
+            exit 0
           fi
           
           # Count Tekton YAML files
           TEKTON_COUNT=$(find .tekton -name "*.yaml" -o -name "*.yml" | wc -l)
           
           if [ "$TEKTON_COUNT" -eq 0 ]; then
-            echo "Error: No Tekton YAML files found in .tekton/" >&2
-            exit 1
+            echo "⚠️  Warning: No Tekton YAML files found in .tekton/"
+            echo "   This is OK for testing."
+            exit 0
           fi
           
-          echo "Found $TEKTON_COUNT Tekton file(s) in .tekton/"
+          echo "✓ Found $TEKTON_COUNT Tekton file(s) in .tekton/"
           find .tekton -name "*.yaml" -o -name "*.yml" | while read file; do
             echo "  - $file"
           done
+        continue-on-error: true
       
       - name: Check if tag exists
         run: |
@@ -120,14 +148,17 @@ jobs:
           
           tag_name = "${{ github.event.inputs.tag_name }}"
           
+          print(f"🔍 Checking if tag '{tag_name}' already exists on remote...")
+          
           # Check remote tags (local check unnecessary - runners start fresh from remote)
           remote_check = subprocess.run(['git', 'ls-remote', '--tags', 'origin', f'refs/tags/{tag_name}'], capture_output=True)
           
           if remote_check.stdout.decode().strip():
-            print(f"Error: Tag '{tag_name}' already exists on remote.", file=sys.stderr)
+            print(f"❌ Error: Tag '{tag_name}' already exists on remote.", file=sys.stderr)
+            print(f"   To delete: git push --delete origin {tag_name}", file=sys.stderr)
             sys.exit(1)
           
-          print(f"Tag '{tag_name}' does not exist. Safe to proceed.")
+          print(f"✓ Tag '{tag_name}' does not exist. Safe to proceed.")
         shell: python
 
   update-params-env:
@@ -138,8 +169,8 @@ jobs:
       - name: Checkout target repository
         uses: actions/checkout@v4
         with:
-          repository: ${{ env.REPO_OWNER }}/${{ needs.setup.outputs.repo_name }}
-          token: ${{ secrets.ROBOT_ACCOUNT_PAT }}
+          repository: ${{ needs.setup.outputs.repo_owner }}/${{ needs.setup.outputs.repo_name }}
+          token: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
           ref: ${{ github.event.inputs.target_branch }}
       
       - name: Find and update params.env files
@@ -154,10 +185,10 @@ jobs:
           params_files = glob.glob('config/**/params.env', recursive=True)
           
           if not params_files:
-            print("No params.env files found in config/ - skipping")
+            print("ℹ️  No params.env files found in config/ - skipping")
             sys.exit(0)
           
-          print("Found params.env files:")
+          print("📝 Found params.env files:")
           for f in params_files:
             print(f"  - {f}")
           print()
@@ -171,7 +202,7 @@ jobs:
               with open(params_file, 'r') as f:
                 lines = f.readlines()
             except Exception as e:
-              print(f"  Warning: Could not read {params_file}: {e}")
+              print(f"  ⚠️  Warning: Could not read {params_file}: {e}")
               continue
             
             updated_lines = []
@@ -191,7 +222,7 @@ jobs:
                 new_line = f"{var_name}={image_path}:{tag_name}\n"
                 updated_lines.append(new_line)
                 changes += 1
-                print(f"  Updated: {var_name} ({old_tag} → {tag_name})")
+                print(f"  ✓ Updated: {var_name} ({old_tag} → {tag_name})")
               else:
                 # Keep line unchanged
                 updated_lines.append(line)
@@ -204,19 +235,21 @@ jobs:
               print(f"  ✓ Updated {changes} image(s) in {params_file}")
               updated_files.append(params_file)
             else:
-              print(f"  No image references found in {params_file}")
+              print(f"  ℹ️  No image references found in {params_file}")
           
           print()
           if updated_files:
             print(f"✓ Updated {len(updated_files)} params.env file(s)")
           else:
-            print("No params.env files contained image references")
+            print("ℹ️  No params.env files contained image references")
         shell: python
+        continue-on-error: true
       
       - name: Configure Git User
         run: |
+          # Note: Git config is set per-job since each job runs in a fresh container
           git config --global user.email "github-actions@github.com"
-          git config --global user.name "GitHub Actions"
+          git config --global user.name "GitHub Actions (Test)"
       
       - name: Commit changes
         run: |
@@ -226,12 +259,13 @@ jobs:
           if [[ -n "$(git status --porcelain)" ]]; then
             TAG_NAME="${{ github.event.inputs.tag_name }}"
             BRANCH="${{ github.event.inputs.target_branch }}"
-            git commit -m "chore: Update image refs for ODH release ${TAG_NAME}"
+            git commit -m "test: Update image refs for test release ${TAG_NAME}"
             git push origin "${BRANCH}"
-            echo "Changes committed and pushed"
+            echo "✓ Changes committed and pushed"
           else
-            echo "No params.env changes to commit"
+            echo "ℹ️  No params.env changes to commit"
           fi
+        continue-on-error: true
 
   create-release:
     name: Create Tag and Release
@@ -242,15 +276,15 @@ jobs:
       - name: Checkout target repository
         uses: actions/checkout@v4
         with:
-          repository: ${{ env.REPO_OWNER }}/${{ needs.setup.outputs.repo_name }}
-          token: ${{ secrets.ROBOT_ACCOUNT_PAT }}
+          repository: ${{ needs.setup.outputs.repo_owner }}/${{ needs.setup.outputs.repo_name }}
+          token: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
           ref: ${{ github.event.inputs.target_branch }}
           fetch-depth: 0
       
       - name: Configure Git User
         run: |
           git config --global user.email "github-actions@github.com"
-          git config --global user.name "GitHub Actions"
+          git config --global user.name "GitHub Actions (Test)"
       
       - name: Pull latest changes
         run: |
@@ -263,23 +297,32 @@ jobs:
         run: |
           TAG_NAME="${{ github.event.inputs.tag_name }}"
           REPO_NAME="${{ needs.setup.outputs.repo_name }}"
-          git tag -a "${TAG_NAME}" -m "ODH release ${TAG_NAME} for ${REPO_NAME}"
+          echo "🏷️  Creating tag ${TAG_NAME}..."
+          git tag -a "${TAG_NAME}" -m "Test release ${TAG_NAME} for ${REPO_NAME}"
           git push origin "${TAG_NAME}"
-          echo "Tag created and pushed"
+          echo "✓ Tag created and pushed"
 
       - name: Create Release
         run: |
           # Set token with trimming to remove any whitespace
-          export GH_TOKEN=$(echo "${{ secrets.ROBOT_ACCOUNT_PAT }}" | tr -d '[:space:]')
-          echo "Creating release for tag ${{ github.event.inputs.tag_name }}..."
+          export GH_TOKEN=$(echo "${{ secrets.PERSONAL_ACCESS_TOKEN }}" | tr -d '[:space:]')
+          echo "📦 Creating release for tag ${{ github.event.inputs.tag_name }}..."
           
+          # Create release using GitHub CLI
           gh release create "${{ github.event.inputs.tag_name }}" \
-            --repo "${{ env.REPO_OWNER }}/${{ needs.setup.outputs.repo_name }}" \
-            --title "${{ github.event.inputs.tag_name }}" \
+            --repo "${{ needs.setup.outputs.repo_owner }}/${{ needs.setup.outputs.repo_name }}" \
+            --title "${{ github.event.inputs.tag_name }} (Test)" \
+            --notes "🧪 **This is a test release**
+          
+          Repository: ${{ needs.setup.outputs.repo_owner }}/${{ needs.setup.outputs.repo_name }}
+          Release Tag: ${{ github.event.inputs.tag_name }}
+          Next Tag: ${{ github.event.inputs.next_odh_tag }}
+          
+          Created by GitHub Actions workflow for testing purposes." \
             --generate-notes
           
-          echo "Release created successfully"
-          echo "View at: https://github.com/${{ env.REPO_OWNER }}/${{ needs.setup.outputs.repo_name }}/releases/tag/${{ github.event.inputs.tag_name }}"
+          echo "✓ Release created successfully"
+          echo "View at: https://github.com/${{ needs.setup.outputs.repo_owner }}/${{ needs.setup.outputs.repo_name }}/releases/tag/${{ github.event.inputs.tag_name }}"
 
   bump-odh-tag:
     name: Bump ODH Tag for Next Release
@@ -290,32 +333,32 @@ jobs:
       - name: Checkout target repository
         uses: actions/checkout@v4
         with:
-          repository: ${{ env.REPO_OWNER }}/${{ needs.setup.outputs.repo_name }}
-          token: ${{ secrets.ROBOT_ACCOUNT_PAT }}
+          repository: ${{ needs.setup.outputs.repo_owner }}/${{ needs.setup.outputs.repo_name }}
+          token: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
           ref: ${{ github.event.inputs.target_branch }}
 
       - name: Update Tekton files with next ODH tag
         run: |
           import sys
-          import os
           import glob
           
           current_tag = "${{ github.event.inputs.tag_name }}"
           next_tag = "${{ github.event.inputs.next_odh_tag }}"
           
-          print(f"Updating ODH tags from {current_tag} to {next_tag}...\n")
+          print(f"🔄 Updating ODH tags from {current_tag} to {next_tag}...\n")
           
           # Find all YAML files in .tekton/
           tekton_files = glob.glob('.tekton/*.yaml') + glob.glob('.tekton/*.yml')
           
           if not tekton_files:
-            print("Warning: No Tekton files found in .tekton/", file=sys.stderr)
-            sys.exit(1)
+            print("⚠️  No Tekton files found in .tekton/ - skipping")
+            print("   This is OK for testing.")
+            exit 0
           
           print(f"Found {len(tekton_files)} Tekton file(s)\n")
           
           updated_files = []
-          errors = []
+          warnings = []
           
           for tekton_file in tekton_files:
             print(f"Processing {tekton_file}...")
@@ -325,7 +368,8 @@ jobs:
               with open(tekton_file, 'r') as f:
                 content = f.read()
             except Exception as e:
-              errors.append(f"Could not read {tekton_file}: {e}")
+              warnings.append(f"Could not read {tekton_file}: {e}")
+              print(f"  ⚠️  Could not read file, skipping...")
               continue
             
             # Replace any occurrence of :current_tag with :next_tag
@@ -339,7 +383,7 @@ jobs:
             
             # Count occurrences
             count = content.count(search_pattern)
-            print(f"  Found {count} occurrence(s) of {search_pattern}")
+            print(f"  ✓ Found {count} occurrence(s) of {search_pattern}")
             
             # Perform replacement
             updated_content = content.replace(search_pattern, replace_pattern)
@@ -353,31 +397,32 @@ jobs:
               verify_content = f.read()
             
             if verify_content.count(replace_pattern) != count:
-              errors.append(f"Replacement verification failed in {tekton_file}")
+              warnings.append(f"Replacement verification failed in {tekton_file}")
+              print(f"  ⚠️  Verification failed")
               continue
             
             print(f"  ✓ Updated {count} occurrence(s) to {replace_pattern}")
             updated_files.append(tekton_file)
           
           print(f"\n{'='*60}")
-          if errors:
-            print("Errors encountered:", file=sys.stderr)
-            for error in errors:
-              print(f"  - {error}", file=sys.stderr)
-            sys.exit(1)
+          if warnings:
+            print("⚠️  Warnings:")
+            for warning in warnings:
+              print(f"  - {warning}")
           
           if updated_files:
             print(f"✓ Successfully updated {len(updated_files)} file(s):")
             for f in updated_files:
               print(f"  - {f}")
           else:
-            print("No files contained the current tag")
+            print("ℹ️  No files contained the current tag")
         shell: python
+        continue-on-error: true
       
       - name: Configure Git User
         run: |
           git config --global user.email "github-actions@github.com"
-          git config --global user.name "GitHub Actions"
+          git config --global user.name "GitHub Actions (Test)"
       
       - name: Commit and Push Changes
         run: |
@@ -388,23 +433,25 @@ jobs:
           if [[ -n "$(git status --porcelain)" ]]; then
             NEXT_TAG="${{ github.event.inputs.next_odh_tag }}"
             BRANCH="${{ github.event.inputs.target_branch }}"
-            git commit -m "chore(konflux): Bump ODH release tag to ${NEXT_TAG}"
+            git commit -m "test: Bump ODH release tag to ${NEXT_TAG}"
             git push origin "${BRANCH}"
-            echo "Changes committed and pushed"
+            echo "✓ Changes committed and pushed"
           else
-            echo "No changes to commit"
+            echo "ℹ️  No changes to commit"
           fi
+        continue-on-error: true
 
   summary:
-    name: Release Summary
+    name: Test Summary
     runs-on: ubuntu-latest
     needs: [setup, validate-and-check, update-params-env, create-release, bump-odh-tag]
     if: always()
     steps:
       - name: Print Summary
         run: |
-          echo "# 🚀 Release Workflow Summary" >> $GITHUB_STEP_SUMMARY
+          echo "# 🧪 Test Release Workflow Summary" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Repository Owner:** ${{ needs.setup.outputs.repo_owner }}" >> $GITHUB_STEP_SUMMARY
           echo "**Repository:** ${{ needs.setup.outputs.repo_name }}" >> $GITHUB_STEP_SUMMARY
           echo "**Release Tag:** ${{ github.event.inputs.tag_name }}" >> $GITHUB_STEP_SUMMARY
           echo "**Next Tag:** ${{ github.event.inputs.next_odh_tag }}" >> $GITHUB_STEP_SUMMARY
@@ -415,12 +462,29 @@ jobs:
           echo "- Update params.env: ${{ needs.update-params-env.result }}" >> $GITHUB_STEP_SUMMARY
           echo "- Create Release: ${{ needs.create-release.result }}" >> $GITHUB_STEP_SUMMARY
           echo "- Bump ODH Tag: ${{ needs.bump-odh-tag.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
           
-          if [[ "${{ needs.bump-odh-tag.result }}" == "success" ]]; then
+          if [[ "${{ needs.create-release.result }}" == "success" ]]; then
+            echo "✅ **Test release workflow completed successfully!**" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
-            echo "✅ **Release workflow completed successfully!**" >> $GITHUB_STEP_SUMMARY
+            echo "You can view the release at:" >> $GITHUB_STEP_SUMMARY
+            echo "https://github.com/${{ needs.setup.outputs.repo_owner }}/${{ needs.setup.outputs.repo_name }}/releases/tag/${{ github.event.inputs.tag_name }}" >> $GITHUB_STEP_SUMMARY
           else
-            echo "" >> $GITHUB_STEP_SUMMARY
             echo "⚠️ **Some steps may have failed. Please review the logs.**" >> $GITHUB_STEP_SUMMARY
           fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "---" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 🧹 Cleanup" >> $GITHUB_STEP_SUMMARY
+          echo "To clean up this test release:" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`bash" >> $GITHUB_STEP_SUMMARY
+          echo "# Delete tag locally and remotely" >> $GITHUB_STEP_SUMMARY
+          echo "git tag -d ${{ github.event.inputs.tag_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "git push --delete origin ${{ github.event.inputs.tag_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "# Delete the GitHub release" >> $GITHUB_STEP_SUMMARY
+          echo "# Go to: https://github.com/${{ needs.setup.outputs.repo_owner }}/${{ needs.setup.outputs.repo_name }}/releases" >> $GITHUB_STEP_SUMMARY
+          echo "# Click on the release and delete it" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
 
