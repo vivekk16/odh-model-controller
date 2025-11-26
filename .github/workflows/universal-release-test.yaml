@@ -353,7 +353,7 @@ jobs:
           if not tekton_files:
             print("⚠️  No Tekton files found in .tekton/ - skipping")
             print("   This is OK for testing.")
-            exit 0
+            sys.exit(0)
           
           print(f"Found {len(tekton_files)} Tekton file(s)\n")
           
