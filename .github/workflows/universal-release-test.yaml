@@ -426,8 +426,8 @@ jobs:
       
       - name: Commit and Push Changes
         run: |
-          # Add all modified Tekton files
-          git add .tekton/*.yaml .tekton/*.yml 2>/dev/null || true
+          # Add all modified files in .tekton directory
+          git add .tekton/
           
           # Check for changes before committing
           if [[ -n "$(git status --porcelain)" ]]; then
