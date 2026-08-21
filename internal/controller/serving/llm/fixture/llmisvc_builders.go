@@ -278,6 +278,23 @@ func WithBaseRefs(refs ...corev1.LocalObjectReference) LLMInferenceServiceOption
 	}
 }
 
+// WithScaling sets the main workload's autoscaling configuration (spec.scaling).
+func WithScaling(scaling *v1alpha2.ScalingSpec) LLMInferenceServiceOption {
+	return func(llmSvc *v1alpha2.LLMInferenceService) {
+		llmSvc.Spec.Scaling = scaling
+	}
+}
+
+// WithPrefillScaling sets the prefill workload's autoscaling configuration (spec.prefill.scaling).
+func WithPrefillScaling(scaling *v1alpha2.ScalingSpec) LLMInferenceServiceOption {
+	return func(llmSvc *v1alpha2.LLMInferenceService) {
+		if llmSvc.Spec.Prefill == nil {
+			llmSvc.Spec.Prefill = &v1alpha2.WorkloadSpec{}
+		}
+		llmSvc.Spec.Prefill.Scaling = scaling
+	}
+}
+
 type LLMInferenceServiceConfigOption ObjectOption[*v1alpha2.LLMInferenceServiceConfig]
 
 func LLMInferenceServiceConfig(name string, opts ...LLMInferenceServiceConfigOption) *v1alpha2.LLMInferenceServiceConfig {

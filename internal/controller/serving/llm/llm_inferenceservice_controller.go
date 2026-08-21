@@ -23,6 +23,7 @@ import (
 
 	"github.com/go-logr/logr"
 	"github.com/hashicorp/go-multierror"
+	kedaapi "github.com/kedacore/keda/v2/apis/keda/v1alpha1"
 	kservev1alpha2 "github.com/kserve/kserve/pkg/apis/serving/v1alpha2"
 	kservellmisvc "github.com/kserve/kserve/pkg/controller/v1alpha2/llmisvc"
 	kserveutils "github.com/kserve/kserve/pkg/utils"
@@ -30,6 +31,7 @@ import (
 	kuadrantv1 "github.com/kuadrant/kuadrant-operator/api/v1"
 	kuadrantv1beta1 "github.com/kuadrant/kuadrant-operator/api/v1beta1"
 	corev1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	apierrs "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -60,6 +62,7 @@ func NewLLMInferenceServiceReconciler(client client.Client, scheme *runtime.Sche
 	subResourceReconcilers := []parentreconcilers.LLMSubResourceReconciler{
 		reconcilers.NewKserveAuthPolicyReconciler(client, scheme),
 		reconcilers.NewKserveAuthPostureReconciler(client, recorder),
+		reconcilers.NewKServeKEDAReconciler(client),
 	}
 
 	return &LLMInferenceServiceReconciler{
@@ -153,9 +156,20 @@ func (r *LLMInferenceServiceReconciler) Reconcile(ctx context.Context, req ctrl.
 func (r *LLMInferenceServiceReconciler) SetupWithManager(mgr ctrl.Manager, setupLog logr.Logger) error {
 	b := ctrl.NewControllerManagedBy(mgr).
 		For(&kservev1alpha2.LLMInferenceService{}).
+		Owns(&rbacv1.Role{}, ctrlbuilder.MatchEveryOwner, ctrlbuilder.WithPredicates(parentreconcilers.KedaLabelPredicate)).
+		Owns(&rbacv1.RoleBinding{}, ctrlbuilder.MatchEveryOwner, ctrlbuilder.WithPredicates(parentreconcilers.KedaLabelPredicate)).
 		Named("llminferenceservice")
 
 	setupLog.Info("Setting up LLMInferenceService controller")
+
+	if ok, err := utils.IsCrdAvailable(mgr.GetConfig(), kedaapi.GroupVersion.String(), "TriggerAuthentication"); err != nil {
+		setupLog.Error(err, "Failed to check CRD availability for TriggerAuthentication")
+	} else if ok {
+		b = b.Owns(&kedaapi.TriggerAuthentication{},
+			ctrlbuilder.MatchEveryOwner,
+			ctrlbuilder.WithPredicates(parentreconcilers.KedaLabelPredicate),
+		)
+	}
 
 	if ok, err := utils.IsCrdAvailable(mgr.GetConfig(), kuadrantv1.GroupVersion.String(), "AuthPolicy"); err != nil {
 		setupLog.Error(err, "Failed to check CRD availability for AuthPolicy")

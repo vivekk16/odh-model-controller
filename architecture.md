@@ -10,7 +10,7 @@ ODH Model Controller is a **companion controller** to [KServe](https://github.co
 - **NVIDIA NIM integration** — Manages NIM Account lifecycle (API key validation, model catalog sync, pull secrets, ServingRuntime templates)
 - **Multi-node Ray TLS** — Generates and distributes CA certificates for Ray head/worker TLS in multi-node serving
 - **Model Registry sync** — Bidirectional sync between InferenceServices and Model Registry metadata
-- **KEDA autoscaling** — Reconciles TriggerAuthentication resources for KEDA-based autoscaling
+- **KEDA autoscaling** — Reconciles a shared set of namespaced authentication resources (ServiceAccount, Secret, Role, RoleBinding, TriggerAuthentication) so KEDA `prometheus` triggers can authenticate to OpenShift Monitoring; shared across InferenceService and LLMInferenceService
 - **LLMInferenceService auth** — Creates Kuadrant AuthPolicies and Istio EnvoyFilters for MaaS (Model-as-a-Service) gateway authentication
 - **Gateway API bootstrap** — Reconciles EnvoyFilter and AuthPolicy resources on Gateways independent of model lifecycle
 - **Webhook enforcement** — Validates InferenceService naming constraints, protects system namespaces, injects Ray TLS init containers
@@ -88,7 +88,7 @@ A standalone REST API server for querying gateway and endpoint information. It i
    - **Metrics dashboard reconciler** — creates ConfigMaps with Grafana dashboard JSON
    - **ClusterRoleBinding reconciler** — grants auth-delegator for secure metrics
    - **ServiceAccount reconciler** — ensures service accounts with proper image pull secrets
-   - **KEDA reconciler** — creates TriggerAuthentication for KEDA autoscaling
+   - **KEDA reconciler** — creates the shared `inference-prometheus-auth` ServiceAccount/Secret/Role/RoleBinding/TriggerAuthentication for InferenceServices with a KEDA `prometheus` external metric (see [KEDA Prometheus Auth Sharing](#keda-prometheus-auth-sharing) below)
 3. Optionally runs Model Registry reconciliation (controlled by `MODELREGISTRY_STATE=managed`)
 4. Cleans up shared namespace resources when the last ISVC is deleted
 
@@ -113,7 +113,10 @@ Placeholder controller that watches InferenceGraph resources. Currently a no-op 
 
 **Responsibilities:**
 1. Resolves BaseRef configs (LLMInferenceServiceConfig) and merges specs using KServe's `MergeSpecs`
-2. Runs sub-reconcilers — currently the **AuthPolicy reconciler** which creates Kuadrant AuthPolicies per-service
+2. Runs sub-reconcilers:
+   - **AuthPolicy reconciler** — creates Kuadrant AuthPolicies per-service
+   - **AuthPosture reconciler** — detects and reports mismatched auth postures across LLMInferenceServices sharing a routing group
+   - **KEDA reconciler** — creates the shared `inference-prometheus-auth` auth resources for LLMInferenceServices using standalone (direct) KEDA scaling with a `prometheus` trigger; see [KEDA Prometheus Auth Sharing](#keda-prometheus-auth-sharing)
 3. Cleans up namespace-scoped resources when the last LLMInferenceService is deleted
 4. Triggers global re-reconciliation when Kuadrant or Authorino instances are created/deleted
 
@@ -181,7 +184,19 @@ The NIM Account controller uses a sequential handler chain pattern where each ha
 
 ### Sub-Reconciler Pattern
 
-Both the InferenceService and LLMInferenceService controllers decompose reconciliation into sub-reconcilers, each responsible for one resource type or concern. Sub-reconcilers implement a common interface (`Reconcile`, `Delete`, `Cleanup` methods) and are iterated in the parent reconciler.
+Both the InferenceService and LLMInferenceService controllers decompose reconciliation into sub-reconcilers, each responsible for one resource type or concern. Sub-reconcilers implement a common interface (`Reconcile`, `Delete`, `Cleanup` methods) and are iterated in the parent reconciler. `GenericSubResourceReconciler[T]` (`internal/controller/serving/reconcilers/types.go`) parameterizes this interface over the owning object's type, so the same shape can back both `SubResourceReconciler` (InferenceService) and `LLMSubResourceReconciler` (LLMInferenceService).
+
+### KEDA Prometheus Auth Sharing
+
+On OpenShift, a KEDA `prometheus` trigger needs a bearer token and CA cert to query Thanos/Prometheus. `KEDAPrometheusAuthReconciler` (`internal/controller/serving/reconcilers/kserve_keda_reconciler.go`) is the owner-agnostic engine that creates and maintains one shared, namespace-scoped set of these auth resources (`inference-prometheus-auth` ServiceAccount, Secret, Role, RoleBinding, and TriggerAuthentication).
+
+Both `InferenceService` (external `prometheus` autoscaling metric) and `LLMInferenceService` (standalone/direct KEDA scaling with a `prometheus` trigger) call into this same engine through thin, CRD-specific wrappers:
+- `internal/controller/serving/reconcilers/kserve_keda_reconciler.go` — `KserveKEDAReconciler` (InferenceService)
+- `internal/controller/serving/llm/reconcilers/kserve_keda_reconciler.go` — `KserveKEDAReconciler` (LLMInferenceService)
+
+Rather than each CRD kind getting a duplicate set of objects, both add themselves as non-controlling owners of the *same* objects (`AsOwnerRef`/`upsertOwnerReference`), so a namespace with both a KEDA-enabled InferenceService and a KEDA-enabled LLMInferenceService shares one auth context. The cleanup decision (`MaybeCleanupNamespace`) re-checks both `InferenceServiceList` and `LLMInferenceServiceList` before deleting anything - regardless of which CRD's controller triggered the check - so deleting the last consumer of one kind never removes auth resources still needed by the other kind. Listing either kind tolerates that kind's CRD not being installed, and an object with a non-zero `DeletionTimestamp` is not counted as still needing the resources (otherwise the very object being deleted would block its own cleanup).
+
+WVA-mediated KEDA scaling (`spec.scaling.wva.keda` on LLMInferenceService) is out of scope for this reconciler - it authenticates via a separate, cluster-scoped `ClusterTriggerAuthentication` configured through KServe's `inferenceservice-config` ConfigMap instead.
 
 ### Delta Processing
 

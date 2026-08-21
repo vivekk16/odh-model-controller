@@ -32,6 +32,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	kedaapi "github.com/kedacore/keda/v2/apis/keda/v1alpha1"
+	kservev1alpha2 "github.com/kserve/kserve/pkg/apis/serving/v1alpha2"
 	kservev1beta1 "github.com/kserve/kserve/pkg/apis/serving/v1beta1"
 )
 
@@ -58,19 +59,24 @@ var _ SubResourceReconciler = (*KserveKEDAReconciler)(nil)
 // KserveKEDAReconciler allows ISVCs to autoscale on custom Prometheus metrics via KEDA, with secure OpenShift Monitoring
 // access. The reconciler automates KEDA/RBAC resource lifecycle.
 //
-// KServeKEDAReconciler manages KEDA-specific resources (ServiceAccount, Secret, Role, RoleBinding, TriggerAuthentication)
-// for Prometheus-based autoscaling.
+// This is a thin, InferenceService-specific wrapper around KEDAPrometheusAuthReconciler, the
+// owner-agnostic engine that actually manages the shared per-namespace auth resources. The
+// same engine (and the same underlying Kubernetes objects) is also used by LLMInferenceService's
+// KEDA reconciler (internal/controller/serving/llm/reconcilers) - see KEDAPrometheusAuthReconciler
+// for details on why these resources are namespace-singleton and multi-owner rather than
+// duplicated per CRD kind.
+//
 // - Creates resources if InferenceService uses KEDA Prometheus external metric.
 // - Adds each InferenceService in a given namespace as non-controlling owner to shared namespaced resources.
 // - Removes InferenceService owner reference if KEDA Prometheus autoscaling is unused or InferenceService deleted.
-// - Cleans up KEDA resources from namespace if no InferenceServices use KEDA Prometheus autoscaling.
+// - Cleans up KEDA resources from namespace if no InferenceServices *or* LLMInferenceServices use KEDA Prometheus autoscaling.
 type KserveKEDAReconciler struct {
-	client client.Client
+	engine *KEDAPrometheusAuthReconciler
 }
 
 func NewKServeKEDAReconciler(client client.Client) *KserveKEDAReconciler {
 	return &KserveKEDAReconciler{
-		client: client,
+		engine: NewKEDAPrometheusAuthReconciler(client),
 	}
 }
 
@@ -84,28 +90,16 @@ func (k *KserveKEDAReconciler) Reconcile(ctx context.Context, log logr.Logger, i
 
 		// When Prometheus autoscaling is not used, we remove the InferenceService as owner reference from
 		// all KEDA-related resources.
-		if err := k.removeOwnerReference(ctx, log, isvc); err != nil {
+		if err := k.engine.RemoveOwnerReference(ctx, log, isvc.GetNamespace(), AsIsvcOwnerRef(isvc)); err != nil {
 			return fmt.Errorf("failed to remove owner reference from KEDA resources: %w", err)
 		}
-		return k.maybeCleanupNamespace(ctx, log, isvc.GetNamespace())
+		return k.engine.MaybeCleanupNamespace(ctx, log, isvc.GetNamespace())
 	}
 
 	log.Info("Reconciling resources")
 
-	if err := retryOnConflicts(func() error { return k.reconcileServiceAccount(ctx, log, isvc) }); err != nil {
-		return fmt.Errorf("failed to reconcile service account: %w", err)
-	}
-	if err := retryOnConflicts(func() error { return k.reconcileSecret(ctx, log, isvc) }); err != nil {
-		return fmt.Errorf("failed to reconcile secret: %w", err)
-	}
-	if err := retryOnConflicts(func() error { return k.reconcileRole(ctx, log, isvc) }); err != nil {
-		return fmt.Errorf("failed to reconcile role: %w", err)
-	}
-	if err := retryOnConflicts(func() error { return k.reconcileRoleBinding(ctx, log, isvc) }); err != nil {
-		return fmt.Errorf("failed to reconcile role binding: %w", err)
-	}
-	if err := retryOnConflicts(func() error { return k.reconcileTriggerAuthentication(ctx, log, isvc) }); err != nil && !meta.IsNoMatchError(err) {
-		return fmt.Errorf("failed to reconcile trigger authentication: %w", err)
+	if err := k.engine.EnsureResources(ctx, log, isvc.GetNamespace(), AsIsvcOwnerRef(isvc), isvc.Annotations); err != nil {
+		return err
 	}
 	log.Info("Successfully reconciled KEDA resources")
 	return nil
@@ -116,33 +110,166 @@ func (k *KserveKEDAReconciler) Delete(ctx context.Context, log logr.Logger, isvc
 	log = log.WithName("KserveKEDAReconciler")
 	log.V(2).Info("KserveKEDAReconciler.Delete called")
 
-	if err := k.removeOwnerReference(ctx, log, isvc); err != nil {
+	if err := k.engine.RemoveOwnerReference(ctx, log, isvc.GetNamespace(), AsIsvcOwnerRef(isvc)); err != nil {
 		return fmt.Errorf("failed to remove owner reference from KEDA resources: %w", err)
 	}
-	return k.maybeCleanupNamespace(ctx, log, isvc.GetNamespace())
+	return k.engine.MaybeCleanupNamespace(ctx, log, isvc.GetNamespace())
 }
 
 func (k *KserveKEDAReconciler) Cleanup(ctx context.Context, log logr.Logger, isvcNs string) error {
 	log = log.WithName("KserveKEDAReconciler")
 	log.V(2).Info("KserveKEDAReconciler.Cleanup called.", "namespace", isvcNs)
-	return k.cleanupNamespace(ctx, log, isvcNs)
+	// Re-verify (rather than trust the caller) that neither an InferenceService nor an
+	// LLMInferenceService in this namespace still needs these shared resources. Callers of
+	// Cleanup only know about their own CRD kind (see DeleteResourcesIfNoIsvcExists /
+	// DeleteResourcesIfNoLLMIsvcExists), so this reconciler must be the one place that checks both.
+	return k.engine.MaybeCleanupNamespace(ctx, log, isvcNs)
 }
 
-func (k *KserveKEDAReconciler) maybeCleanupNamespace(ctx context.Context, log logr.Logger, namespace string) error {
+// hasPrometheusExternalAutoscalingMetric returns true if the InferenceService's predictor
+// declares a KEDA "prometheus" external autoscaling metric.
+func hasPrometheusExternalAutoscalingMetric(isvc *kservev1beta1.InferenceService, log logr.Logger) bool {
+	log.V(1).Info("hasPrometheusExternalAutoscalingMetric", "autoscaling", isvc.Spec.Predictor.AutoScaling)
+	if isvc.Spec.Predictor.AutoScaling == nil {
+		return false
+	}
+	for _, m := range isvc.Spec.Predictor.AutoScaling.Metrics {
+		if m.External != nil && m.External.Metric.Backend == kservev1beta1.PrometheusBackend {
+			return true
+		}
+	}
+	return false
+}
+
+// HasPrometheusKEDATrigger returns true if the LLMInferenceService's standalone (direct) KEDA
+// scaling configuration - main or prefill - includes a user-defined trigger backed by the
+// "prometheus" scaler.
+//
+// WVA-mediated KEDA (spec.scaling.wva.keda / spec.prefill.scaling.wva.keda) is intentionally
+// excluded here: it already authenticates to Prometheus/Thanos via a separate, cluster-scoped
+// ClusterTriggerAuthentication configured through kserve's inferenceservice-config ConfigMap
+// (autoscaling-wva-controller-config key), and does not need the namespaced auth resources
+// this reconciler manages.
+func HasPrometheusKEDATrigger(llmisvc *kservev1alpha2.LLMInferenceService) bool {
+	if scalingSpecHasPrometheusKEDATrigger(llmisvc.Spec.Scaling) {
+		return true
+	}
+	if llmisvc.Spec.Prefill != nil && scalingSpecHasPrometheusKEDATrigger(llmisvc.Spec.Prefill.Scaling) {
+		return true
+	}
+	return false
+}
+
+func scalingSpecHasPrometheusKEDATrigger(scaling *kservev1alpha2.ScalingSpec) bool {
+	if scaling == nil || scaling.KEDA == nil {
+		return false
+	}
+	for _, trigger := range scaling.KEDA.Triggers {
+		if trigger.Type == "prometheus" {
+			return true
+		}
+	}
+	return false
+}
+
+// KEDAPrometheusAuthReconciler manages KEDA-specific resources (ServiceAccount, Secret, Role,
+// RoleBinding, TriggerAuthentication) that let a KEDA "prometheus" trigger authenticate to
+// OpenShift's Thanos/Prometheus. It is namespace-scoped and owner-agnostic: any object kind
+// that needs authenticated Prometheus access from a KEDA ScaledObject (currently InferenceService
+// and LLMInferenceService) can call into it, and all such consumers in a namespace share the
+// exact same underlying objects via non-controlling, multi-owner OwnerReferences rather than
+// each getting a duplicate set.
+type KEDAPrometheusAuthReconciler struct {
+	client client.Client
+}
+
+func NewKEDAPrometheusAuthReconciler(client client.Client) *KEDAPrometheusAuthReconciler {
+	return &KEDAPrometheusAuthReconciler{
+		client: client,
+	}
+}
+
+// EnsureResources creates or updates the full set of shared KEDA Prometheus-auth resources in
+// namespace, adding ownerRef as a (non-controlling) owner of each.
+func (k *KEDAPrometheusAuthReconciler) EnsureResources(ctx context.Context, log logr.Logger, namespace string, ownerRef metav1.OwnerReference, annotations map[string]string) error {
+	if err := retryOnConflicts(func() error { return k.reconcileServiceAccount(ctx, log, namespace, ownerRef) }); err != nil {
+		return fmt.Errorf("failed to reconcile service account: %w", err)
+	}
+	if err := retryOnConflicts(func() error { return k.reconcileSecret(ctx, log, namespace, ownerRef) }); err != nil {
+		return fmt.Errorf("failed to reconcile secret: %w", err)
+	}
+	if err := retryOnConflicts(func() error { return k.reconcileRole(ctx, log, namespace, ownerRef, annotations) }); err != nil {
+		return fmt.Errorf("failed to reconcile role: %w", err)
+	}
+	if err := retryOnConflicts(func() error { return k.reconcileRoleBinding(ctx, log, namespace, ownerRef, annotations) }); err != nil {
+		return fmt.Errorf("failed to reconcile role binding: %w", err)
+	}
+	if err := retryOnConflicts(func() error { return k.reconcileTriggerAuthentication(ctx, log, namespace, ownerRef, annotations) }); err != nil && !meta.IsNoMatchError(err) {
+		return fmt.Errorf("failed to reconcile trigger authentication: %w", err)
+	}
+	return nil
+}
+
+// RemoveOwnerReference removes ownerRef from all shared KEDA Prometheus-auth resources in
+// namespace, without deleting the resources themselves. Callers should follow this with
+// MaybeCleanupNamespace to delete the resources once nothing owns them anymore.
+func (k *KEDAPrometheusAuthReconciler) RemoveOwnerReference(ctx context.Context, log logr.Logger, namespace string, ownerRef metav1.OwnerReference) error {
+	var encounteredErrors []error
+
+	for _, rc := range k.resourcesToCleanup() {
+		if err := retryOnConflicts(func() error { return k.removeOwnerReferenceFromObject(ctx, log, rc, namespace, ownerRef) }); err != nil {
+			err := fmt.Errorf("failed to remove owner reference from %s %s: %w", rc.GetObjectKind(), rc.GetName(), err)
+			encounteredErrors = append(encounteredErrors, err)
+		}
+	}
+
+	if len(encounteredErrors) > 0 {
+		err := multierror.Append(nil, encounteredErrors...)
+		return fmt.Errorf("encountered %d error(s) during owner reference removal: %w", len(encounteredErrors), err)
+	}
+	return nil
+}
+
+// MaybeCleanupNamespace deletes the shared KEDA Prometheus-auth resources in namespace, but
+// only if no InferenceService and no LLMInferenceService in that namespace still needs them.
+// This check is deliberately performed here (rather than trusted from callers) because callers
+// such as DeleteResourcesIfNoIsvcExists / DeleteResourcesIfNoLLMIsvcExists only have visibility
+// into their own CRD kind.
+//
+// Listing either kind tolerates that kind's CRD not being installed at all (meta.IsNoMatchError):
+// a deployment running only the LLM controller (or only the v1beta1 controller) without the other
+// CRD installed is treated as having zero instances of that kind, not as an error.
+//
+// Objects that are themselves terminating (non-zero DeletionTimestamp, e.g. held open by their
+// own finalizer) are not counted as "still needing" the shared resources - otherwise the very
+// object whose deletion triggered this call would block its own cleanup.
+func (k *KEDAPrometheusAuthReconciler) MaybeCleanupNamespace(ctx context.Context, log logr.Logger, namespace string) error {
 	inferenceServiceList := &kservev1beta1.InferenceServiceList{}
-	if err := k.client.List(ctx, inferenceServiceList, client.InNamespace(namespace)); err != nil {
-		return err
+	if err := k.client.List(ctx, inferenceServiceList, client.InNamespace(namespace)); err != nil && !meta.IsNoMatchError(err) {
+		return fmt.Errorf("failed to list InferenceServices in namespace %s: %w", namespace, err)
 	}
 	for _, isvc := range inferenceServiceList.Items {
-		if hasPrometheusExternalAutoscalingMetric(&isvc, log) {
+		if isvc.GetDeletionTimestamp().IsZero() && hasPrometheusExternalAutoscalingMetric(&isvc, log) {
 			// There are still InferenceServices with Prometheus autoscaling configured, nothing to remove.
 			return nil
 		}
 	}
+
+	llmInferenceServiceList := &kservev1alpha2.LLMInferenceServiceList{}
+	if err := k.client.List(ctx, llmInferenceServiceList, client.InNamespace(namespace)); err != nil && !meta.IsNoMatchError(err) {
+		return fmt.Errorf("failed to list LLMInferenceServices in namespace %s: %w", namespace, err)
+	}
+	for _, llmisvc := range llmInferenceServiceList.Items {
+		if llmisvc.GetDeletionTimestamp().IsZero() && HasPrometheusKEDATrigger(&llmisvc) {
+			// There are still LLMInferenceServices with a Prometheus KEDA trigger configured, nothing to remove.
+			return nil
+		}
+	}
+
 	return k.cleanupNamespace(ctx, log, namespace)
 }
 
-func (k *KserveKEDAReconciler) cleanupNamespace(ctx context.Context, log logr.Logger, namespace string) error {
+func (k *KEDAPrometheusAuthReconciler) cleanupNamespace(ctx context.Context, log logr.Logger, namespace string) error {
 	log.Info("Cleaning up KEDA resources in namespace", "namespace", namespace)
 	var encounteredErrors []error
 	for _, r := range k.resourcesToCleanup() {
@@ -158,20 +285,20 @@ func (k *KserveKEDAReconciler) cleanupNamespace(ctx context.Context, log logr.Lo
 }
 
 // --- TriggerAuthentication ---
-func (k *KserveKEDAReconciler) reconcileTriggerAuthentication(ctx context.Context, log logr.Logger, isvc *kservev1beta1.InferenceService) error {
-	expected := k.expectedTriggerAuthentication(isvc)
+func (k *KEDAPrometheusAuthReconciler) reconcileTriggerAuthentication(ctx context.Context, log logr.Logger, namespace string, ownerRef metav1.OwnerReference, annotations map[string]string) error {
+	expected := k.expectedTriggerAuthentication(namespace, ownerRef, annotations)
 	curr := &kedaapi.TriggerAuthentication{}
 	key := client.ObjectKey{Namespace: expected.Namespace, Name: expected.Name}
 
 	err := k.client.Get(ctx, key, curr)
 	if err != nil {
 		if errors.IsNotFound(err) {
-			return k.createTriggerAuthentication(ctx, log, isvc)
+			return k.createTriggerAuthentication(ctx, log, namespace, ownerRef, annotations)
 		}
 		return fmt.Errorf("failed to get TriggerAuthentication %s: %w", key.String(), err)
 	}
 
-	expected.OwnerReferences = upsertOwnerReference(AsIsvcOwnerRef(isvc), curr)
+	expected.OwnerReferences = upsertOwnerReference(ownerRef, curr)
 	expected.ResourceVersion = curr.ResourceVersion
 
 	if equality.Semantic.DeepDerivative(expected.Spec, curr.Spec) &&
@@ -189,23 +316,23 @@ func (k *KserveKEDAReconciler) reconcileTriggerAuthentication(ctx context.Contex
 	return nil
 }
 
-func (k *KserveKEDAReconciler) createTriggerAuthentication(ctx context.Context, log logr.Logger, isvc *kservev1beta1.InferenceService) error {
+func (k *KEDAPrometheusAuthReconciler) createTriggerAuthentication(ctx context.Context, log logr.Logger, namespace string, ownerRef metav1.OwnerReference, annotations map[string]string) error {
 	log.Info("Creating TriggerAuthentication", "name", KEDAPrometheusAuthTriggerAuthName)
-	ta := k.expectedTriggerAuthentication(isvc)
+	ta := k.expectedTriggerAuthentication(namespace, ownerRef, annotations)
 	if err := k.client.Create(ctx, ta); err != nil && !errors.IsAlreadyExists(err) {
 		return fmt.Errorf("failed to create TriggerAuthentication %s/%s: %w", ta.Namespace, ta.Name, err)
 	}
 	return nil
 }
 
-func (k *KserveKEDAReconciler) expectedTriggerAuthentication(isvc *kservev1beta1.InferenceService) *kedaapi.TriggerAuthentication {
+func (k *KEDAPrometheusAuthReconciler) expectedTriggerAuthentication(namespace string, ownerRef metav1.OwnerReference, annotations map[string]string) *kedaapi.TriggerAuthentication {
 	return &kedaapi.TriggerAuthentication{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:            KEDAPrometheusAuthTriggerAuthName,
-			Namespace:       isvc.Namespace,
-			OwnerReferences: []metav1.OwnerReference{AsIsvcOwnerRef(isvc)},
+			Namespace:       namespace,
+			OwnerReferences: []metav1.OwnerReference{ownerRef},
 			Labels:          getKedaLabels(),
-			Annotations:     isvc.Annotations,
+			Annotations:     annotations,
 		},
 		Spec: kedaapi.TriggerAuthenticationSpec{
 			SecretTargetRef: []kedaapi.AuthSecretTargetRef{
@@ -225,20 +352,20 @@ func (k *KserveKEDAReconciler) expectedTriggerAuthentication(isvc *kservev1beta1
 }
 
 // --- ServiceAccount ---
-func (k *KserveKEDAReconciler) reconcileServiceAccount(ctx context.Context, log logr.Logger, isvc *kservev1beta1.InferenceService) error {
-	expected := k.expectedServiceAccount(isvc)
+func (k *KEDAPrometheusAuthReconciler) reconcileServiceAccount(ctx context.Context, log logr.Logger, namespace string, ownerRef metav1.OwnerReference) error {
+	expected := k.expectedServiceAccount(namespace, ownerRef)
 	curr := &corev1.ServiceAccount{}
 	key := client.ObjectKey{Namespace: expected.Namespace, Name: expected.Name}
 
 	err := k.client.Get(ctx, key, curr)
 	if err != nil {
 		if errors.IsNotFound(err) {
-			return k.createServiceAccount(ctx, log, isvc)
+			return k.createServiceAccount(ctx, log, namespace, ownerRef)
 		}
 		return fmt.Errorf("failed to get ServiceAccount %s: %w", key.String(), err)
 	}
 
-	expected.OwnerReferences = upsertOwnerReference(AsIsvcOwnerRef(isvc), curr)
+	expected.OwnerReferences = upsertOwnerReference(ownerRef, curr)
 	expected.ResourceVersion = curr.ResourceVersion
 
 	if equality.Semantic.DeepDerivative(expected.Labels, curr.Labels) &&
@@ -255,21 +382,21 @@ func (k *KserveKEDAReconciler) reconcileServiceAccount(ctx context.Context, log 
 	return nil
 }
 
-func (k *KserveKEDAReconciler) createServiceAccount(ctx context.Context, log logr.Logger, isvc *kservev1beta1.InferenceService) error {
+func (k *KEDAPrometheusAuthReconciler) createServiceAccount(ctx context.Context, log logr.Logger, namespace string, ownerRef metav1.OwnerReference) error {
 	log.Info("Creating ServiceAccount", "name", KEDAPrometheusAuthServiceAccountName)
-	sa := k.expectedServiceAccount(isvc)
+	sa := k.expectedServiceAccount(namespace, ownerRef)
 	if err := k.client.Create(ctx, sa); err != nil && !errors.IsAlreadyExists(err) {
 		return fmt.Errorf("failed to create ServiceAccount %s/%s: %w", sa.Namespace, sa.Name, err)
 	}
 	return nil
 }
 
-func (k *KserveKEDAReconciler) expectedServiceAccount(isvc *kservev1beta1.InferenceService) *corev1.ServiceAccount {
+func (k *KEDAPrometheusAuthReconciler) expectedServiceAccount(namespace string, ownerRef metav1.OwnerReference) *corev1.ServiceAccount {
 	return &corev1.ServiceAccount{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:            KEDAPrometheusAuthServiceAccountName,
-			Namespace:       isvc.Namespace,
-			OwnerReferences: []metav1.OwnerReference{AsIsvcOwnerRef(isvc)},
+			Namespace:       namespace,
+			OwnerReferences: []metav1.OwnerReference{ownerRef},
 			Labels:          getKedaLabels(),
 		},
 		// ServiceAccount Spec is mostly empty; Secrets and ImagePullSecrets are managed via sub-resources or user additions.
@@ -277,20 +404,20 @@ func (k *KserveKEDAReconciler) expectedServiceAccount(isvc *kservev1beta1.Infere
 }
 
 // --- Secret ---
-func (k *KserveKEDAReconciler) reconcileSecret(ctx context.Context, log logr.Logger, isvc *kservev1beta1.InferenceService) error {
-	expected := k.expectedSecret(isvc)
+func (k *KEDAPrometheusAuthReconciler) reconcileSecret(ctx context.Context, log logr.Logger, namespace string, ownerRef metav1.OwnerReference) error {
+	expected := k.expectedSecret(namespace, ownerRef)
 	curr := &corev1.Secret{}
 	key := client.ObjectKey{Namespace: expected.Namespace, Name: expected.Name}
 
 	err := k.client.Get(ctx, key, curr)
 	if err != nil {
 		if errors.IsNotFound(err) {
-			return k.createSecret(ctx, log, isvc)
+			return k.createSecret(ctx, log, namespace, ownerRef)
 		}
 		return fmt.Errorf("failed to get Secret %s: %w", key.String(), err)
 	}
 
-	expected.OwnerReferences = upsertOwnerReference(AsIsvcOwnerRef(isvc), curr)
+	expected.OwnerReferences = upsertOwnerReference(ownerRef, curr)
 	expected.ResourceVersion = curr.ResourceVersion
 
 	if expected.Type == curr.Type &&
@@ -311,22 +438,22 @@ func (k *KserveKEDAReconciler) reconcileSecret(ctx context.Context, log logr.Log
 	return nil
 }
 
-func (k *KserveKEDAReconciler) createSecret(ctx context.Context, log logr.Logger, isvc *kservev1beta1.InferenceService) error {
+func (k *KEDAPrometheusAuthReconciler) createSecret(ctx context.Context, log logr.Logger, namespace string, ownerRef metav1.OwnerReference) error {
 	log.Info("Creating Secret", "name", KEDAPrometheusAuthTriggerSecretName)
-	secret := k.expectedSecret(isvc)
+	secret := k.expectedSecret(namespace, ownerRef)
 	if err := k.client.Create(ctx, secret); err != nil && !errors.IsAlreadyExists(err) {
 		return fmt.Errorf("failed to create Secret %s/%s: %w", secret.Namespace, secret.Name, err)
 	}
 	return nil
 }
 
-func (k *KserveKEDAReconciler) expectedSecret(isvc *kservev1beta1.InferenceService) *corev1.Secret {
+func (k *KEDAPrometheusAuthReconciler) expectedSecret(namespace string, ownerRef metav1.OwnerReference) *corev1.Secret {
 
 	return &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:            KEDAPrometheusAuthTriggerSecretName,
-			Namespace:       isvc.Namespace,
-			OwnerReferences: []metav1.OwnerReference{AsIsvcOwnerRef(isvc)},
+			Namespace:       namespace,
+			OwnerReferences: []metav1.OwnerReference{ownerRef},
 			Labels:          getKedaLabels(),
 			Annotations: map[string]string{
 				corev1.ServiceAccountNameKey: KEDAPrometheusAuthServiceAccountName,
@@ -338,20 +465,20 @@ func (k *KserveKEDAReconciler) expectedSecret(isvc *kservev1beta1.InferenceServi
 }
 
 // --- Role ---
-func (k *KserveKEDAReconciler) reconcileRole(ctx context.Context, log logr.Logger, isvc *kservev1beta1.InferenceService) error {
-	expected := k.expectedRole(isvc)
+func (k *KEDAPrometheusAuthReconciler) reconcileRole(ctx context.Context, log logr.Logger, namespace string, ownerRef metav1.OwnerReference, annotations map[string]string) error {
+	expected := k.expectedRole(namespace, ownerRef, annotations)
 	curr := &rbacv1.Role{}
 	key := client.ObjectKey{Namespace: expected.Namespace, Name: expected.Name}
 
 	err := k.client.Get(ctx, key, curr)
 	if err != nil {
 		if errors.IsNotFound(err) {
-			return k.createRole(ctx, log, isvc)
+			return k.createRole(ctx, log, namespace, ownerRef, annotations)
 		}
 		return fmt.Errorf("failed to get Role %s: %w", key.String(), err)
 	}
 
-	expected.OwnerReferences = upsertOwnerReference(AsIsvcOwnerRef(isvc), curr)
+	expected.OwnerReferences = upsertOwnerReference(ownerRef, curr)
 	expected.ResourceVersion = curr.ResourceVersion
 
 	if equality.Semantic.DeepDerivative(expected.Rules, curr.Rules) &&
@@ -369,23 +496,23 @@ func (k *KserveKEDAReconciler) reconcileRole(ctx context.Context, log logr.Logge
 	return nil
 }
 
-func (k *KserveKEDAReconciler) createRole(ctx context.Context, log logr.Logger, isvc *kservev1beta1.InferenceService) error {
+func (k *KEDAPrometheusAuthReconciler) createRole(ctx context.Context, log logr.Logger, namespace string, ownerRef metav1.OwnerReference, annotations map[string]string) error {
 	log.Info("Creating Role", "name", KEDAPrometheusAuthMetricsReaderRoleName)
-	role := k.expectedRole(isvc)
+	role := k.expectedRole(namespace, ownerRef, annotations)
 	if err := k.client.Create(ctx, role); err != nil && !errors.IsAlreadyExists(err) {
 		return fmt.Errorf("failed to create Role %s/%s: %w", role.Namespace, role.Name, err)
 	}
 	return nil
 }
 
-func (k *KserveKEDAReconciler) expectedRole(isvc *kservev1beta1.InferenceService) *rbacv1.Role {
+func (k *KEDAPrometheusAuthReconciler) expectedRole(namespace string, ownerRef metav1.OwnerReference, annotations map[string]string) *rbacv1.Role {
 	return &rbacv1.Role{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:            KEDAPrometheusAuthMetricsReaderRoleName,
-			Namespace:       isvc.Namespace,
-			OwnerReferences: []metav1.OwnerReference{AsIsvcOwnerRef(isvc)},
+			Namespace:       namespace,
+			OwnerReferences: []metav1.OwnerReference{ownerRef},
 			Labels:          getKedaLabels(),
-			Annotations:     isvc.Annotations,
+			Annotations:     annotations,
 		},
 		Rules: []rbacv1.PolicyRule{
 			{
@@ -403,20 +530,20 @@ func (k *KserveKEDAReconciler) expectedRole(isvc *kservev1beta1.InferenceService
 }
 
 // --- RoleBinding ---
-func (k *KserveKEDAReconciler) reconcileRoleBinding(ctx context.Context, log logr.Logger, isvc *kservev1beta1.InferenceService) error {
-	expected := k.expectedRoleBinding(isvc)
+func (k *KEDAPrometheusAuthReconciler) reconcileRoleBinding(ctx context.Context, log logr.Logger, namespace string, ownerRef metav1.OwnerReference, annotations map[string]string) error {
+	expected := k.expectedRoleBinding(namespace, ownerRef, annotations)
 	curr := &rbacv1.RoleBinding{}
 	key := client.ObjectKey{Namespace: expected.Namespace, Name: expected.Name}
 
 	err := k.client.Get(ctx, key, curr)
 	if err != nil {
 		if errors.IsNotFound(err) {
-			return k.createRoleBinding(ctx, log, isvc)
+			return k.createRoleBinding(ctx, log, namespace, ownerRef, annotations)
 		}
 		return fmt.Errorf("failed to get RoleBinding %s: %w", key.String(), err)
 	}
 
-	expected.OwnerReferences = upsertOwnerReference(AsIsvcOwnerRef(isvc), curr)
+	expected.OwnerReferences = upsertOwnerReference(ownerRef, curr)
 	expected.ResourceVersion = curr.ResourceVersion
 
 	if equality.Semantic.DeepDerivative(expected.Subjects, curr.Subjects) &&
@@ -435,29 +562,29 @@ func (k *KserveKEDAReconciler) reconcileRoleBinding(ctx context.Context, log log
 	return nil
 }
 
-func (k *KserveKEDAReconciler) createRoleBinding(ctx context.Context, log logr.Logger, isvc *kservev1beta1.InferenceService) error {
+func (k *KEDAPrometheusAuthReconciler) createRoleBinding(ctx context.Context, log logr.Logger, namespace string, ownerRef metav1.OwnerReference, annotations map[string]string) error {
 	log.Info("Creating RoleBinding", "name", KEDAPrometheusAuthMetricsReaderRoleBindingName)
-	rb := k.expectedRoleBinding(isvc)
+	rb := k.expectedRoleBinding(namespace, ownerRef, annotations)
 	if err := k.client.Create(ctx, rb); err != nil && !errors.IsAlreadyExists(err) {
 		return fmt.Errorf("failed to create RoleBinding %s/%s: %w", rb.Namespace, rb.Name, err)
 	}
 	return nil
 }
 
-func (k *KserveKEDAReconciler) expectedRoleBinding(isvc *kservev1beta1.InferenceService) *rbacv1.RoleBinding {
+func (k *KEDAPrometheusAuthReconciler) expectedRoleBinding(namespace string, ownerRef metav1.OwnerReference, annotations map[string]string) *rbacv1.RoleBinding {
 	return &rbacv1.RoleBinding{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:            KEDAPrometheusAuthMetricsReaderRoleBindingName,
-			Namespace:       isvc.Namespace,
-			OwnerReferences: []metav1.OwnerReference{AsIsvcOwnerRef(isvc)},
+			Namespace:       namespace,
+			OwnerReferences: []metav1.OwnerReference{ownerRef},
 			Labels:          getKedaLabels(),
-			Annotations:     isvc.Annotations,
+			Annotations:     annotations,
 		},
 		Subjects: []rbacv1.Subject{
 			{
 				Kind:      rbacv1.ServiceAccountKind,
 				Name:      KEDAPrometheusAuthResourceName,
-				Namespace: isvc.Namespace,
+				Namespace: namespace,
 			},
 		},
 		RoleRef: rbacv1.RoleRef{
@@ -468,32 +595,10 @@ func (k *KserveKEDAReconciler) expectedRoleBinding(isvc *kservev1beta1.Inference
 	}
 }
 
-// removeOwnerReference attempts to remove the ISVC's owner reference from all KEDA-related resources.
-// It collects errors and returns a summary error if any occurred.
-func (k *KserveKEDAReconciler) removeOwnerReference(ctx context.Context, log logr.Logger, isvc *kservev1beta1.InferenceService) error {
-	ownerRefToRemove := AsIsvcOwnerRef(isvc)
-	var encounteredErrors []error
-
-	resourceCleanups := k.resourcesToCleanup()
-
-	for _, rc := range resourceCleanups {
-		if err := retryOnConflicts(func() error { return k.removeOwnerReferenceFromObject(ctx, log, rc, isvc.Namespace, ownerRefToRemove) }); err != nil {
-			err := fmt.Errorf("failed to remove owner reference from %s %s: %w", rc.GetObjectKind(), rc.GetName(), err)
-			encounteredErrors = append(encounteredErrors, err)
-		}
-	}
-
-	if len(encounteredErrors) > 0 {
-		err := multierror.Append(nil, encounteredErrors...)
-		return fmt.Errorf("encountered %d error(s) during owner reference removal: %w", len(encounteredErrors), err)
-	}
-	return nil
-}
-
 // removeOwnerReferenceFromObject fetches a Kubernetes object and removes a specific owner reference.
 // If the object or the owner reference is not found, it's a no-op for that object.
 // obj parameter must be a pointer to an empty struct of the target resource kind (e.g., &corev1.ServiceAccount{}).
-func (k *KserveKEDAReconciler) removeOwnerReferenceFromObject(
+func (k *KEDAPrometheusAuthReconciler) removeOwnerReferenceFromObject(
 	ctx context.Context,
 	log logr.Logger,
 	obj client.Object,
@@ -521,7 +626,7 @@ func (k *KserveKEDAReconciler) removeOwnerReferenceFromObject(
 	for _, ref := range originalOwnerReferences {
 		// Match by UID, as this is the unique identifier for an owner reference instance.
 		if ref.UID == ownerRefToRemove.UID {
-			log.V(1).Info("Matching ISVC owner reference found, will be removed.",
+			log.V(1).Info("Matching owner reference found, will be removed.",
 				"ownerRefUID", ref.UID, "resourceKind", obj.GetObjectKind(), "resourceName", obj.GetName())
 		} else {
 			newOwnerReferences = append(newOwnerReferences, ref)
@@ -536,23 +641,10 @@ func (k *KserveKEDAReconciler) removeOwnerReferenceFromObject(
 	if err := k.client.Update(ctx, obj); err != nil && !errors.IsNotFound(err) && !meta.IsNoMatchError(err) {
 		return fmt.Errorf("failed to update %s %s after removing owner reference: %w", obj.GetObjectKind(), key.String(), err)
 	}
-	log.Info("Successfully removed ISVC owner reference and updated resource",
+	log.Info("Successfully removed owner reference and updated resource",
 		"resourceKind", obj.GetObjectKind(), "resourceName", obj.GetName(), "namespace", obj.GetNamespace())
 
 	return nil
-}
-
-func hasPrometheusExternalAutoscalingMetric(isvc *kservev1beta1.InferenceService, log logr.Logger) bool {
-	log.V(1).Info("hasPrometheusExternalAutoscalingMetric", "autoscaling", isvc.Spec.Predictor.AutoScaling)
-	if isvc.Spec.Predictor.AutoScaling == nil {
-		return false
-	}
-	for _, m := range isvc.Spec.Predictor.AutoScaling.Metrics {
-		if m.External != nil && m.External.Metric.Backend == kservev1beta1.PrometheusBackend {
-			return true
-		}
-	}
-	return false
 }
 
 func upsertOwnerReference(expected metav1.OwnerReference, obj client.Object) []metav1.OwnerReference {
@@ -584,7 +676,7 @@ func retryOnConflicts(f func() error) error {
 	return retry.RetryOnConflict(retry.DefaultRetry, f)
 }
 
-func (k *KserveKEDAReconciler) resourcesToCleanup() []client.Object {
+func (k *KEDAPrometheusAuthReconciler) resourcesToCleanup() []client.Object {
 	return []client.Object{
 		&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: KEDAPrometheusAuthServiceAccountName}},
 		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: KEDAPrometheusAuthTriggerSecretName}},

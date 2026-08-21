@@ -19,6 +19,7 @@ package testing
 import (
 	"path/filepath"
 
+	kedaapi "github.com/kedacore/keda/v2/apis/keda/v1alpha1"
 	authorinooperatorv1beta1 "github.com/kuadrant/authorino-operator/api/v1beta1"
 	kuadrantv1 "github.com/kuadrant/kuadrant-operator/api/v1"
 	kuadrantv1beta1 "github.com/kuadrant/kuadrant-operator/api/v1beta1"
@@ -31,6 +32,7 @@ import (
 
 	kservev1alpha1 "github.com/kserve/kserve/pkg/apis/serving/v1alpha1"
 	kservev1alpha2 "github.com/kserve/kserve/pkg/apis/serving/v1alpha2"
+	kservev1beta1 "github.com/kserve/kserve/pkg/apis/serving/v1beta1"
 
 	istioclientv1alpha3 "istio.io/client-go/pkg/apis/networking/v1alpha3"
 	igwapi "sigs.k8s.io/gateway-api-inference-extension/api/v1"
@@ -46,6 +48,7 @@ func NewEnvTest(options ...Option) *Config {
 		// KServe Schemes
 		kservev1alpha1.AddToScheme,
 		kservev1alpha2.AddToScheme,
+		kservev1beta1.AddToScheme,
 		// Kubernetes Schemes
 		corev1.AddToScheme,
 		rbacv1.AddToScheme,
@@ -59,6 +62,7 @@ func NewEnvTest(options ...Option) *Config {
 		igwapi.Install,
 		istioclientv1alpha3.AddToScheme,
 		monitoringv1.AddToScheme,
+		kedaapi.AddToScheme,
 	)
 
 	return Configure(append(options, testCRDs, schemes)...)
